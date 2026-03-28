@@ -315,7 +315,8 @@ and parseable by any standard JSON library.
 | 0x03         | `call_end`     | Call terminated                 |
 | 0x04         | `heartbeat`    | Keep-alive                      |
 | 0x05         | `call_metadata`| Call-level metadata (JSON)      |
-| 0x06–0xFF    | —              | Reserved; skip via payload_len  |
+| 0x06         | `audio_data`   | Opaque audio blob (see [AVCF spec](https://github.com/trunk-reporter/tr-plugin-avcf/blob/main/AVCF_SPEC.md)) |
+| 0x07–0xFF    | —              | Reserved; skip via payload_len  |
 
 ---
 
