@@ -39,14 +39,37 @@ Files are a concatenation of binary messages (8-byte SSSP headers + codec frame 
 
 ## Building
 
+Builds as a `user_plugins` drop-in — no fork of trunk-recorder required. Requires trunk-recorder with `voice_codec_data()` plugin API support (v5.0+).
+
 ```bash
-# From trunk-recorder source root
-mkdir -p user_plugins && cp -r /path/to/tr-plugin-dvcf user_plugins/mqtt_dvcf
+# 1. Clone trunk-recorder
+git clone https://github.com/TrunkRecorder/trunk-recorder.git
+cd trunk-recorder
+
+# 2. Drop this plugin into user_plugins/
+mkdir -p user_plugins
+git clone https://github.com/trunk-reporter/tr-plugin-dvcf user_plugins/mqtt_dvcf
+
+# 3. Build with local plugins enabled
 cmake -B build -DUSE_LOCAL_PLUGINS=ON
-cmake --build build
+cmake --build build -j$(nproc)
+
+# 4. Install
+sudo cmake --install build
 ```
 
-Or place alongside other plugins in `plugins/` and add to `CMakeLists.txt`.
+The compiled `libmqtt_dvcf.so` will be installed to `/usr/local/lib/trunk-recorder/` (or your configured prefix).
+
+### Dependencies
+
+- Paho MQTT C++ library (`libpaho-mqttpp3-dev`)
+- Paho MQTT C library (`libpaho-mqtt3as-dev`)
+- Boost (already required by trunk-recorder)
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install libpaho-mqtt3as-dev libpaho-mqttpp3-dev
+```
 
 ## Configuration
 
