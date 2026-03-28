@@ -99,30 +99,50 @@ Add to your trunk-recorder `config.json`:
 | `write_enabled` | `true` | Write `.dvcf` sidecar files to disk |
 | `mqtt_enabled` | `false` | Publish codec frames over MQTT |
 | `broker` | `tcp://localhost:1883` | MQTT broker URL |
-| `topic` | `tr/feeds` | MQTT topic (matches tr-engine ingest topic) |
-| `clientid` | `dvcf-plugin` | MQTT client ID |
+| `topic` | `trunk-recorder` | MQTT topic prefix (publishes to `{topic}/dvcf`) |
+| `clientid` | `dvcf-handler` | MQTT client ID |
 | `username` | `""` | MQTT username (optional) |
 | `password` | `""` | MQTT password (optional) |
 | `qos` | `0` | MQTT QoS level |
 
 ## MQTT Message Format
 
-When `mqtt_enabled: true`, the plugin appends an `audio_tap_base64` field to the standard trunk-recorder call-end MQTT message:
+When `mqtt_enabled: true`, the plugin publishes a JSON message on `{topic}/dvcf` containing the base64-encoded `.dvcf` content and call metadata:
 
 ```json
 {
-  "call": { ... },
-  "audio_tap_base64": "<base64-encoded .dvcf content>"
+  "audio_dvcf_base64": "<base64-encoded .dvcf content>",
+  "metadata": {
+    "talkgroup": 9170,
+    "talkgroup_tag": "Fire Dispatch",
+    "talkgroup_alpha_tag": "BUTCO FD",
+    "talkgroup_group": "Fire",
+    "freq": 855737500,
+    "start_time": 1711234567,
+    "stop_time": 1711234590,
+    "call_length": 23,
+    "signal": -42.5,
+    "noise": -110.2,
+    "freq_error": 12,
+    "spike_count": 0,
+    "emergency": false,
+    "priority": 3,
+    "phase2_tdma": false,
+    "tdma_slot": 0,
+    "short_name": "butco",
+    "filename": "9170-1711234567_855737500.wav",
+    "srcList": [{"src": 1234567, "time": 1711234567, "pos": 0.0, "emergency": 0, "signal_system": "", "tag": "Engine 5"}]
+  }
 }
 ```
 
-[tr-engine](https://github.com/trunk-reporter/tr-engine) recognizes this field and routes the call to the IMBE-ASR transcription provider.
+[tr-engine](https://github.com/trunk-reporter/tr-engine) recognizes the `audio_dvcf_base64` field and routes the call to the IMBE-ASR transcription provider.
 
 ## Integration
 
 ```
 trunk-recorder + mqtt_dvcf plugin
-    → MQTT (audio_tap_base64)
+    → MQTT (audio_dvcf_base64)
     → tr-engine (STT_PROVIDER=imbe)
     → imbe-asr server
     → transcript stored in database

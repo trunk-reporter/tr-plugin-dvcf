@@ -36,6 +36,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
@@ -53,6 +55,7 @@ static constexpr uint8_t  SSSP_VERSION         = 0x02;
 static constexpr uint8_t  SSSP_MSG_CODEC_FRAME = 0x01;
 static constexpr uint8_t  SSSP_MSG_CALL_START  = 0x02;
 static constexpr uint8_t  SSSP_MSG_CALL_END    = 0x03;
+static constexpr uint8_t  SSSP_MSG_CALL_METADATA = 0x05;
 
 /* ── Packed binary structures ────────────────────────────────────────── */
 
@@ -177,8 +180,8 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
     int qos_ = 0;
 
     // MQTT runtime
-    mqtt::async_client *mqtt_client_ = nullptr;
-    bool mqtt_connected_ = false;
+    std::unique_ptr<mqtt::async_client> mqtt_client_;
+    std::atomic<bool> mqtt_connected_{false};
 
     // Disk temp dir
     std::string tmp_dir_;
@@ -203,6 +206,49 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
         m.timestamp_us = cs.start_us; m.call_id = cs.call_id; m.system_name_len = nlen;
         emit(cs, &m, sizeof(m));
         if (nlen) emit(cs, cs.short_name.data(), nlen);
+    }
+
+    void emit_call_metadata(CallState &cs, const Call_Data_t &info) {
+        nlohmann::ordered_json meta;
+
+        if (!info.talkgroup_tag.empty())         meta["tg_tag"] = info.talkgroup_tag;
+        if (!info.talkgroup_alpha_tag.empty())    meta["tg_alpha_tag"] = info.talkgroup_alpha_tag;
+        if (!info.talkgroup_group.empty())        meta["tg_group"] = info.talkgroup_group;
+        if (!info.talkgroup_description.empty())  meta["tg_description"] = info.talkgroup_description;
+
+        meta["signal"] = info.signal;
+        meta["noise"] = info.noise;
+        meta["freq_error"] = info.freq_error;
+        meta["spike_count"] = info.spike_count;
+        meta["emergency"] = info.emergency;
+        meta["priority"] = info.priority;
+        meta["phase2_tdma"] = info.phase2_tdma;
+        meta["tdma_slot"] = info.tdma_slot;
+
+        if (!info.patched_talkgroups.empty()) {
+            nlohmann::ordered_json ptgs = nlohmann::ordered_json::array();
+            for (const auto tg : info.patched_talkgroups) ptgs.push_back(tg);
+            meta["patched_tgs"] = ptgs;
+        }
+
+        if (!info.transmission_source_list.empty()) {
+            nlohmann::ordered_json src_list = nlohmann::ordered_json::array();
+            for (const auto &src : info.transmission_source_list) {
+                src_list.push_back({
+                    {"src", src.source}, {"time", src.time}, {"pos", src.position},
+                    {"emergency", src.emergency}, {"signal_system", src.signal_system},
+                    {"tag", src.tag}
+                });
+            }
+            meta["src_list"] = src_list;
+        }
+
+        std::string json_str = meta.dump();
+        uint32_t json_len = static_cast<uint32_t>(json_str.size());
+        sssp_header_t hdr;
+        fill_header(hdr, SSSP_MSG_CALL_METADATA, json_len);
+        emit(cs, &hdr, sizeof(hdr));
+        emit(cs, json_str.data(), json_len);
     }
 
     void emit_call_end(CallState &cs, const Call_Data_t &info) {
@@ -253,7 +299,9 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
             std::ifstream s(tmp, std::ios::binary);
             std::ofstream d(dst, std::ios::binary | std::ios::trunc);
             if (!s || !d) return false;
-            d << s.rdbuf(); d.close(); s.close();
+            d << s.rdbuf();
+            if (!d.good()) { d.close(); std::remove(dst.c_str()); return false; }
+            d.close(); s.close();
             std::remove(tmp.c_str());
             return true;
         }
@@ -265,13 +313,14 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
     /* ── MQTT helpers ────────────────────────────────────────────────── */
 
     void mqtt_connect() {
+        // SSL verification disabled — typical deployment is LAN-only to a local broker.
         auto ssl = mqtt::ssl_options_builder().verify(false).enable_server_cert_auth(false).finalize();
         auto opts = mqtt::connect_options_builder().clean_session()
             .ssl(ssl).automatic_reconnect(std::chrono::seconds(10), std::chrono::seconds(40)).finalize();
         if (!username_.empty() && !password_.empty()) {
             opts.set_user_name(username_); opts.set_password(password_);
         }
-        mqtt_client_ = new mqtt::async_client(broker_, client_id_);
+        mqtt_client_ = std::make_unique<mqtt::async_client>(broker_, client_id_);
         mqtt_client_->set_callback(*this);
         try {
             BOOST_LOG_TRIVIAL(info) << TAG << "Connecting to " << broker_;
@@ -296,14 +345,26 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
             {"audio_dvcf_base64", b64},
             {"metadata", {
                 {"talkgroup", info.talkgroup}, {"talkgroup_tag", info.talkgroup_tag},
+                {"talkgroup_alpha_tag", info.talkgroup_alpha_tag},
+                {"talkgroup_group", info.talkgroup_group},
                 {"freq", info.freq}, {"start_time", info.start_time},
                 {"stop_time", info.stop_time},
                 {"call_length", info.stop_time - info.start_time},
+                {"signal", info.signal}, {"noise", info.noise},
+                {"freq_error", info.freq_error}, {"spike_count", info.spike_count},
+                {"emergency", info.emergency}, {"priority", info.priority},
+                {"phase2_tdma", info.phase2_tdma}, {"tdma_slot", info.tdma_slot},
                 {"short_name", info.short_name},
                 {"filename", basename_of(info.filename)},
                 {"srcList", src_list}
             }}
         };
+
+        if (!info.patched_talkgroups.empty()) {
+            nlohmann::ordered_json ptgs = nlohmann::ordered_json::array();
+            for (const auto tg : info.patched_talkgroups) ptgs.push_back(tg);
+            payload["metadata"]["patched_talkgroups"] = ptgs;
+        }
 
         std::string pub_topic = topic_ + "/dvcf";
         try {
@@ -330,7 +391,7 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
 
 public:
     Dvcf_Handler() {}
-    ~Dvcf_Handler() override { delete mqtt_client_; }
+    ~Dvcf_Handler() override = default;
 
     /* ── Plugin_Api ──────────────────────────────────────────────────── */
 
@@ -376,7 +437,7 @@ public:
             catch (...) {}
             mqtt_connected_ = false;
         }
-        delete mqtt_client_; mqtt_client_ = nullptr;
+        mqtt_client_.reset();
         return 0;
     }
 
@@ -450,7 +511,10 @@ public:
         if (!write_enabled_ && !mqtt_enabled_) return 0;
         std::lock_guard<std::mutex> lk(mu_);
 
-        // Find matching stream
+        // Find matching stream.  call_end receives Call_Data_t (not Call*),
+        // so we match on talkgroup + short_name.  This can mismatch if two
+        // concurrent calls share the same TG and system — a trunk-recorder
+        // API limitation (no call pointer or call_id in Call_Data_t).
         uintptr_t key = 0;
         for (auto &kv : calls_) {
             if (kv.second.talkgroup == call_info.talkgroup &&
@@ -459,7 +523,8 @@ public:
         if (!key) return 0;
         CallState &cs = calls_[key];
 
-        // Write CALL_END record
+        // Write CALL_METADATA + CALL_END records
+        emit_call_metadata(cs, call_info);
         emit_call_end(cs, call_info);
 
         std::string b64;

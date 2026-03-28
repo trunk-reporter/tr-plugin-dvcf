@@ -3,8 +3,8 @@
 Framing specification for streaming raw voice codec parameters (IMBE, AMBE+2, AMBE, etc.)
 from trunk-recorder to external consumers via TCP or UDP.
 
-**Status:** Draft specification. The current plugin implements [v1 (legacy)](#version-1-legacy-reference).
-A future plugin update will add v2 support.
+**Status:** Draft specification. The current plugin (`mqtt_dvcf`) implements v2 binary framing.
+See [§13](#13-version-1-legacy-reference) for the legacy v1 format.
 
 ---
 
@@ -19,10 +19,10 @@ A future plugin update will add v2 support.
 7. [Codec Parameter Tables](#7-codec-parameter-tables)
 8. [C Reference Structures and Examples](#8-c-reference-structures-and-examples)
 9. [File Format](#9-file-format)
-9. [Receiver Guide](#9-receiver-guide)
-10. [Bandwidth](#10-bandwidth)
-11. [Compatibility](#11-compatibility)
-12. [Version 1 Legacy Reference](#12-version-1-legacy-reference)
+10. [Receiver Guide](#10-receiver-guide)
+11. [Bandwidth](#11-bandwidth)
+12. [Compatibility](#12-compatibility)
+13. [Version 1 Legacy Reference](#13-version-1-legacy-reference)
 
 ---
 
@@ -138,6 +138,69 @@ Sent when a call terminates.
 `payload_len = 0`, no payload. Sent periodically (default: 30 s) by the plugin to detect
 dead connections. Receivers should reset a watchdog timer on receipt.
 
+### 3.6 CALL_METADATA (msg_type = 0x05)
+
+Optional per-call metadata as a JSON payload. Enables .dvcf files to be self-contained
+for dataset building without external talkgroup databases.
+
+```
+ Offset  Size  Type    Field
+ 0       N     char[]  UTF-8 JSON object (no null terminator; N = payload_len from header)
+```
+
+The JSON object contains call-level metadata from trunk-recorder's `Call_Data_t`. All
+fields are optional — omit absent fields rather than setting them to null. Receivers
+must ignore unknown keys.
+
+**Fields:**
+
+| Key              | Type     | Description                                    |
+|------------------|----------|------------------------------------------------|
+| `tg_tag`         | string   | Human-readable talkgroup name                  |
+| `tg_alpha_tag`   | string   | Short alphabetic talkgroup label               |
+| `tg_group`       | string   | Domain category (e.g., Fire, Police, EMS)      |
+| `tg_description` | string   | Full talkgroup description                     |
+| `signal`         | float    | Signal level (dBFS)                            |
+| `noise`          | float    | Noise floor (dBFS)                             |
+| `freq_error`     | int      | Frequency error (Hz)                           |
+| `spike_count`    | int      | Spike count                                    |
+| `emergency`      | bool     | Emergency call flag                            |
+| `priority`       | int      | Call priority level                            |
+| `phase2_tdma`    | bool     | P25 Phase 2 TDMA mode                          |
+| `tdma_slot`      | int      | TDMA slot (0 or 1)                             |
+| `patched_tgs`    | int[]    | Cross-patched talkgroup IDs                    |
+| `src_list`       | object[] | Transmission source list (see below)           |
+
+**`src_list` entry fields:**
+
+| Key              | Type   | Description                       |
+|------------------|--------|-----------------------------------|
+| `src`            | int    | Source radio ID                   |
+| `time`           | int    | Transmission start time (epoch)   |
+| `pos`            | float  | Position within call (seconds)    |
+| `emergency`      | int    | Emergency flag (0 or 1)           |
+| `signal_system`  | string | Signal system identifier          |
+| `tag`            | string | Unit/radio tag (e.g., "Engine 5") |
+
+**Example:**
+
+```json
+{
+  "tg_tag": "Fire Dispatch",
+  "tg_group": "Fire",
+  "signal": -42.5,
+  "noise": -110.2,
+  "emergency": false,
+  "src_list": [
+    {"src": 1234567, "time": 1711234567, "pos": 0.0, "emergency": 0, "signal_system": "", "tag": "Engine 5"}
+  ]
+}
+```
+
+In a `.dvcf` file, `CALL_METADATA` is typically emitted after the last `CODEC_FRAME` and
+before `CALL_END`. However, receivers must dispatch on `msg_type`, not position — the
+message may appear at any point in the stream.
+
 ---
 
 ## 4. JSON Format
@@ -251,7 +314,8 @@ and parseable by any standard JSON library.
 | 0x02         | `call_start`   | New call beginning              |
 | 0x03         | `call_end`     | Call terminated                 |
 | 0x04         | `heartbeat`    | Keep-alive                      |
-| 0x05–0xFF    | —              | Reserved; skip via payload_len  |
+| 0x05         | `call_metadata`| Call-level metadata (JSON)      |
+| 0x06–0xFF    | —              | Reserved; skip via payload_len  |
 
 ---
 
@@ -602,9 +666,51 @@ void sssp_receive_loop(int fd) {
 
 ---
 
-## 9. Receiver Guide
+## 9. File Format
 
-### 9.1 Binary Mode State Machine
+### 9.1 File Extension
+
+The canonical file extension for SymbolStream v2 binary captures is **`.dvcf`** (Digital Voice Codec Frames).
+
+A `.dvcf` file is a concatenation of SymbolStream v2 binary messages (§3) representing a single call. The typical structure is:
+
+1. One `CALL_START` message
+2. N × `CODEC_FRAME` messages (one per voice frame, 20ms / 50fps for IMBE)
+3. One `CALL_METADATA` message (optional; call-level metadata as JSON, see §3.6)
+4. One `CALL_END` message
+
+Receivers must dispatch on `msg_type`, not on message position within the file.
+`CALL_METADATA` may appear at any point between `CALL_START` and `CALL_END`.
+
+### 9.2 MIME Type
+
+`application/x-dvcf` (unregistered; use for HTTP uploads and content-type headers).
+
+### 9.3 File Naming Convention
+
+`.dvcf` files are written as sidecar files alongside audio recordings. Given an audio file:
+
+```
+9173-1774473273.232_852687500.0-call_39.wav
+```
+
+The corresponding codec capture is:
+
+```
+9173-1774473273.232_852687500.0-call_39.dvcf
+```
+
+Same base name, `.dvcf` extension. This allows downstream consumers (e.g., the MQTT plugin, tr-engine) to discover the codec data by replacing the audio file extension.
+
+### 9.4 Relationship to Transport
+
+The file format uses the same binary framing as the TCP/UDP transport (§3). A `.dvcf` file can be replayed over a TCP connection, or a TCP stream can be saved directly to a `.dvcf` file. No additional framing or headers are needed beyond the per-message headers defined in §3.
+
+---
+
+## 10. Receiver Guide
+
+### 10.1 Binary Mode State Machine
 
 ```
 1. Create TCP server socket, bind to port, listen.
@@ -624,7 +730,7 @@ void sssp_receive_loop(int fd) {
    e. On EOF or socket error: log and reconnect (or exit).
 ```
 
-### 9.2 JSON Mode State Machine
+### 10.2 JSON Mode State Machine
 
 ```
 1. Create TCP server socket, bind, listen.
@@ -640,7 +746,7 @@ void sssp_receive_loop(int fd) {
       unknown       → log and ignore
 ```
 
-### 9.3 Error Handling
+### 10.3 Error Handling
 
 | Situation            | Recommended action                                       |
 |----------------------|----------------------------------------------------------|
@@ -651,14 +757,14 @@ void sssp_receive_loop(int fd) {
 | Truncated payload    | Connection lost; close and reconnect                    |
 | UDP packet loss      | Normal; gaps in call_id are not errors                  |
 
-### 9.4 Minimal Receiver (Python sketch)
+### 10.4 Minimal Receiver (Python sketch)
 
 See `symbolstream_recv.py` in this repository for a ~150-line reference implementation
 handling both binary and JSON modes, including call lifecycle tracking.
 
 ---
 
-## 10. Bandwidth
+## 11. Bandwidth
 
 At 50 fps (20 ms frames):
 
@@ -676,9 +782,9 @@ JSON mode is intended for development, debugging, and low-volume monitoring only
 
 ---
 
-## 11. Compatibility
+## 12. Compatibility
 
-### 11.1 v2 vs v1
+### 12.1 v2 vs v1
 
 v2 is a **breaking wire-format change** from v1.
 
@@ -689,7 +795,7 @@ v2 is a **breaking wire-format change** from v1.
   `4-byte-length + JSON-only` with params inline. Receivers can detect v2 JSON by checking
   for `"v":2` in the parsed object.
 
-### 11.2 Forward Compatibility
+### 12.2 Forward Compatibility
 
 - Receivers must skip unknown `msg_type` values using `payload_len`.
 - Receivers must skip unknown `codec_type` values using `param_count`.
@@ -699,11 +805,11 @@ v2 is a **breaking wire-format change** from v1.
 
 ---
 
-## 12. Version 1 (Legacy) Reference
+## 13. Version 1 (Legacy) Reference
 
 The current symbolstream C++ plugin sends one of two formats, controlled by `sendJSON` in config.
 
-### 12.1 sendJSON = false (binary only)
+### 13.1 sendJSON = false (binary only)
 
 Fixed 40-byte packet per IMBE frame. No codec_type, no version, no call events.
 
@@ -714,7 +820,7 @@ Fixed 40-byte packet per IMBE frame. No codec_type, no version, no call events.
  8       32    uint32[8] IMBE codewords u[0..7]
 ```
 
-### 12.2 sendJSON = true (hybrid JSON + binary)
+### 13.2 sendJSON = true (hybrid JSON + binary)
 
 Per-frame message:
 
@@ -753,41 +859,3 @@ Call events (JSON only, no binary tail):
 - Hybrid JSON+binary — awkward to parse, not composable with standard JSON tools
 - Codec type missing from binary mode — receiver must infer from context
 - Only IMBE is sent (codec_type != 0 is filtered out in the plugin)
-
----
-
-## 9. File Format
-
-### 9.1 File Extension
-
-The canonical file extension for SymbolStream v2 binary captures is **`.dvcf`** (Digital Voice Codec Frames).
-
-A `.dvcf` file is a concatenation of SymbolStream v2 binary messages (§3) representing a single call. The typical structure is:
-
-1. One `CALL_START` message
-2. N × `CODEC_FRAME` messages (one per voice frame, 20ms / 50fps for IMBE)
-3. One `CALL_END` message
-
-### 9.2 MIME Type
-
-`application/x-dvcf` (unregistered; use for HTTP uploads and content-type headers).
-
-### 9.3 File Naming Convention
-
-`.dvcf` files are written as sidecar files alongside audio recordings. Given an audio file:
-
-```
-9173-1774473273.232_852687500.0-call_39.wav
-```
-
-The corresponding codec capture is:
-
-```
-9173-1774473273.232_852687500.0-call_39.dvcf
-```
-
-Same base name, `.dvcf` extension. This allows downstream consumers (e.g., the MQTT plugin, tr-engine) to discover the codec data by replacing the audio file extension.
-
-### 9.4 Relationship to Transport
-
-The file format uses the same binary framing as the TCP/UDP transport (§3). A `.dvcf` file can be replayed over a TCP connection, or a TCP stream can be saved directly to a `.dvcf` file. No additional framing or headers are needed beyond the per-message headers defined in §3.
