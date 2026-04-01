@@ -489,11 +489,15 @@ public:
                         << cs.call_id << " TG=" << cs.talkgroup
                         << " (" << cs.frame_count << " frames) → " << dst;
                 } else {
-                    BOOST_LOG_TRIVIAL(warning) << TAG << "Reaping stale call_id="
+                    BOOST_LOG_TRIVIAL(warning) << TAG << "Salvage rename failed for call_id="
                         << cs.call_id << " TG=" << cs.talkgroup
-                        << " (" << cs.frame_count << " frames, salvage rename failed)";
+                        << " (" << cs.frame_count << " frames), preserving "
+                        << cs.tmp_path;
                 }
-                cs.tmp_path.clear();  // prevent ~CallState from removing the salvaged file
+                // Prevent ~CallState from removing the file in either case —
+                // on success the .stale file should be kept, on failure the
+                // .tmp file is preserved for manual recovery.
+                cs.tmp_path.clear();
             } else {
                 BOOST_LOG_TRIVIAL(warning) << TAG << "Reaping stale call_id="
                     << cs.call_id << " TG=" << cs.talkgroup
@@ -614,6 +618,19 @@ public:
                     std::vector<uint8_t> buf(std::istreambuf_iterator<char>(probe), {});
                     b64 = bytes_to_base64(buf);
                 }
+            } else {
+                BOOST_LOG_TRIVIAL(error) << TAG << "finalize failed for call_id="
+                    << cs.call_id << " TG=" << cs.talkgroup
+                    << ": " << tmp << " → " << dvcf;
+                // Data is still intact in tmp — try MQTT publish from it
+                if (mqtt_enabled_) {
+                    std::ifstream rd(tmp, std::ios::binary);
+                    if (rd) {
+                        std::vector<uint8_t> buf(std::istreambuf_iterator<char>(rd), {});
+                        b64 = bytes_to_base64(buf);
+                    }
+                }
+                std::remove(tmp.c_str());
             }
         } else if (mqtt_enabled_) {
             // Memory-only path: encode directly from buffer
