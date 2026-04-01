@@ -145,8 +145,8 @@ struct CallState {
     uint64_t    start_us       = 0;
     uint64_t    last_active_us = 0;
     std::string short_name;
-    bool        started     = false;
     uint32_t    frame_count = 0;
+    bool        poisoned    = false;
 
     // Disk writing (write_enabled)
     std::string   tmp_path;
@@ -195,8 +195,15 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
     /* ── Output helpers (write to file or memory) ────────────────────── */
 
     void emit(CallState &cs, const void *data, size_t len) {
+        if (cs.poisoned) return;
         if (write_enabled_) {
             cs.file.write(static_cast<const char *>(data), len);
+            if (!cs.file.good()) {
+                BOOST_LOG_TRIVIAL(error) << TAG << "Write failed for call_id="
+                    << cs.call_id << " TG=" << cs.talkgroup
+                    << ": " << strerror(errno);
+                cs.poisoned = true;
+            }
         } else {
             auto p = static_cast<const uint8_t *>(data);
             cs.mem_buf.insert(cs.mem_buf.end(), p, p + len);
@@ -429,7 +436,9 @@ public:
         if (write_enabled_) {
             tmp_dir_ = "/tmp/mqtt_dvcf_" + std::to_string(getpid());
             if (::mkdir(tmp_dir_.c_str(), 0700) != 0 && errno != EEXIST) {
-                BOOST_LOG_TRIVIAL(error) << TAG << "Cannot create " << tmp_dir_;
+                BOOST_LOG_TRIVIAL(error) << TAG << "Cannot create " << tmp_dir_
+                    << ": " << strerror(errno)
+                    << " — file writing DISABLED";
                 write_enabled_ = false;
             }
         }
@@ -445,7 +454,11 @@ public:
         calls_.clear();
         if (mqtt_client_ && mqtt_connected_) {
             try { mqtt_client_->disconnect()->wait_for(std::chrono::seconds(5)); }
-            catch (...) {}
+            catch (const std::exception &e) {
+                BOOST_LOG_TRIVIAL(warning) << TAG << "MQTT disconnect error: " << e.what();
+            } catch (...) {
+                BOOST_LOG_TRIVIAL(warning) << TAG << "MQTT disconnect: unknown exception";
+            }
             mqtt_connected_ = false;
         }
         mqtt_client_.reset();
@@ -460,14 +473,35 @@ public:
 
         uint64_t cutoff = now_us() - stale_timeout_us_;
         for (auto it = calls_.begin(); it != calls_.end(); ) {
-            if (it->second.last_active_us < cutoff) {
-                BOOST_LOG_TRIVIAL(warning) << TAG << "Reaping stale call_id="
-                    << it->second.call_id << " TG=" << it->second.talkgroup
-                    << " (" << it->second.frame_count << " frames, no call_end)";
-                it = calls_.erase(it);  // ~CallState cleans up file + tmp
+            CallState &cs = it->second;
+            if (cs.last_active_us >= cutoff) { ++it; continue; }
+
+            if (cs.frame_count > 0 && !cs.poisoned && write_enabled_ && cs.file.is_open()) {
+                // Salvage: flush and rename with .stale suffix so data isn't lost
+                cs.file.flush();
+                cs.file.close();
+                std::string dst = cs.tmp_path;
+                auto pos = dst.rfind(".tmp");
+                if (pos != std::string::npos) dst.replace(pos, 4, ".stale");
+                else dst += ".stale";
+                if (std::rename(cs.tmp_path.c_str(), dst.c_str()) == 0) {
+                    BOOST_LOG_TRIVIAL(warning) << TAG << "Salvaged stale call_id="
+                        << cs.call_id << " TG=" << cs.talkgroup
+                        << " (" << cs.frame_count << " frames) → " << dst;
+                } else {
+                    BOOST_LOG_TRIVIAL(warning) << TAG << "Reaping stale call_id="
+                        << cs.call_id << " TG=" << cs.talkgroup
+                        << " (" << cs.frame_count << " frames, salvage rename failed)";
+                }
+                cs.tmp_path.clear();  // prevent ~CallState from removing the salvaged file
             } else {
-                ++it;
+                BOOST_LOG_TRIVIAL(warning) << TAG << "Reaping stale call_id="
+                    << cs.call_id << " TG=" << cs.talkgroup
+                    << " (" << cs.frame_count << " frames, no call_end)"
+                    << (cs.tmp_path.empty() ? "" : " file=" + cs.tmp_path);
+                // ~CallState handles cleanup of file + tmp if still open
             }
+            it = calls_.erase(it);
         }
         return 0;
     }
@@ -477,9 +511,7 @@ public:
     int call_start(Call *call) override {
         if (!write_enabled_ && !mqtt_enabled_) return 0;
         std::lock_guard<std::mutex> lk(mu_);
-        CallState *cs = get_or_create(call);
-        if (!cs) return 0;
-        cs->started = true;
+        get_or_create(call);
         return 0;
     }
 
@@ -502,17 +534,18 @@ public:
         if (!cs) return 0;
         chdr.call_id = cs->call_id;
 
+        if (cs->poisoned) return 0;
+
         // First frame: open file and write CALL_START header
         if (cs->frame_count == 0) {
             if (!ensure_file_open(*cs)) {
                 BOOST_LOG_TRIVIAL(error) << TAG << "Dropping call_id=" << cs->call_id
                     << " TG=" << cs->talkgroup << ": file open failed";
-                cs->frame_count = UINT32_MAX;  // poison — suppress per-frame retries
+                cs->poisoned = true;
                 return 0;
             }
             emit_call_start(*cs);
         }
-        if (cs->frame_count == UINT32_MAX) return 0;  // poisoned
 
         emit(*cs, &hdr, sizeof(hdr));
         emit(*cs, &chdr, sizeof(chdr));
@@ -541,7 +574,7 @@ public:
         CallState &cs = calls_[key];
 
         // No usable codec frames — analog calls, poisoned calls, or empty streams.
-        if (cs.frame_count == 0 || cs.frame_count == UINT32_MAX) {
+        if (cs.frame_count == 0 || cs.poisoned) {
             calls_.erase(key);
             return 0;
         }
@@ -553,7 +586,18 @@ public:
         std::string b64;
 
         if (write_enabled_) {
-            cs.file.flush(); cs.file.close();
+            cs.file.flush();
+            if (!cs.file.good()) {
+                BOOST_LOG_TRIVIAL(error) << TAG << "Discarding corrupt call_id="
+                    << cs.call_id << " TG=" << cs.talkgroup
+                    << " (" << cs.frame_count << " frames): write errors on "
+                    << cs.tmp_path;
+                cs.file.close();
+                if (!cs.tmp_path.empty()) std::remove(cs.tmp_path.c_str());
+                calls_.erase(key);
+                return 0;
+            }
+            cs.file.close();
             if (call_info.filename.empty()) {
                 std::remove(cs.tmp_path.c_str()); cs.tmp_path.clear();
                 calls_.erase(key); return 0;
