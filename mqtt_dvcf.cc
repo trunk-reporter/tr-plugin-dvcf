@@ -138,12 +138,13 @@ static std::string bytes_to_base64(const std::vector<uint8_t> &buf) {
 /* ── Per-call state ──────────────────────────────────────────────────── */
 
 struct CallState {
-    long        talkgroup = 0;
-    uint32_t    call_id   = 0;
-    uint64_t    freq_hz   = 0;
-    uint64_t    start_us  = 0;
+    long        talkgroup   = 0;
+    uint32_t    call_id     = 0;
+    uint64_t    freq_hz     = 0;
+    uint64_t    start_us    = 0;
     std::string short_name;
-    bool        started   = false;
+    bool        started     = false;
+    uint32_t    frame_count = 0;
 
     // Disk writing (write_enabled)
     std::string   tmp_path;
@@ -278,17 +279,18 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
         cs.freq_hz    = static_cast<uint64_t>(call->get_freq());
         cs.start_us   = now_us();
         cs.short_name = call->get_short_name();
-
-        if (write_enabled_) {
-            cs.tmp_path = tmp_dir_ + "/call_" + std::to_string(cs.call_id) + ".dvcf.tmp";
-            cs.file.open(cs.tmp_path, std::ios::binary | std::ios::trunc);
-            if (!cs.file.is_open()) {
-                BOOST_LOG_TRIVIAL(error) << TAG << "Cannot open " << cs.tmp_path;
-                calls_.erase(key);
-                return nullptr;
-            }
-        }
         return &cs;
+    }
+
+    bool ensure_file_open(CallState &cs) {
+        if (!write_enabled_ || cs.file.is_open()) return true;
+        cs.tmp_path = tmp_dir_ + "/call_" + std::to_string(cs.call_id) + ".dvcf.tmp";
+        cs.file.open(cs.tmp_path, std::ios::binary | std::ios::trunc);
+        if (!cs.file.is_open()) {
+            BOOST_LOG_TRIVIAL(error) << TAG << "Cannot open " << cs.tmp_path;
+            return false;
+        }
+        return true;
     }
 
     /* ── Disk finalization ───────────────────────────────────────────── */
@@ -448,35 +450,7 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         CallState *cs = get_or_create(call);
         if (!cs) return 0;
-
-        if (!cs->started) {
-            cs->talkgroup  = call->get_talkgroup();
-            cs->freq_hz    = static_cast<uint64_t>(call->get_freq());
-            cs->start_us   = now_us();
-            cs->short_name = call->get_short_name();
-            cs->started    = true;
-
-            if (write_enabled_ && cs->file.tellp() > 0) {
-                // Frames arrived before call_start — rewrite with CALL_START first
-                cs->file.close();
-                std::ifstream rd(cs->tmp_path, std::ios::binary | std::ios::ate);
-                size_t sz = rd.tellg(); rd.seekg(0);
-                std::vector<uint8_t> old(sz);
-                rd.read(reinterpret_cast<char *>(old.data()), sz); rd.close();
-                cs->file.open(cs->tmp_path, std::ios::binary | std::ios::trunc);
-                if (!cs->file.is_open()) { calls_.erase(reinterpret_cast<uintptr_t>(call)); return 0; }
-                emit_call_start(*cs);
-                cs->file.write(reinterpret_cast<const char *>(old.data()), old.size());
-            } else if (!write_enabled_ && !cs->mem_buf.empty()) {
-                // Same reorder for memory buffer
-                std::vector<uint8_t> old; old.swap(cs->mem_buf);
-                emit_call_start(*cs);
-                cs->mem_buf.insert(cs->mem_buf.end(), old.begin(), old.end());
-            } else {
-                emit_call_start(*cs);
-            }
-            if (write_enabled_) cs->file.flush();
-        }
+        cs->started = true;
         return 0;
     }
 
@@ -499,9 +473,19 @@ public:
         if (!cs) return 0;
         chdr.call_id = cs->call_id;
 
+        // First frame: open file and write CALL_START header
+        if (cs->frame_count == 0) {
+            if (!ensure_file_open(*cs)) {
+                calls_.erase(reinterpret_cast<uintptr_t>(call));
+                return 0;
+            }
+            emit_call_start(*cs);
+        }
+
         emit(*cs, &hdr, sizeof(hdr));
         emit(*cs, &chdr, sizeof(chdr));
         if (param_count > 0) emit(*cs, params, psz);
+        ++cs->frame_count;
         return 0;
     }
 
@@ -522,6 +506,9 @@ public:
         }
         if (!key) return 0;
         CallState &cs = calls_[key];
+
+        // No codec frames received — nothing was written (e.g. analog calls).
+        if (cs.frame_count == 0) { calls_.erase(key); return 0; }
 
         // Write CALL_METADATA + CALL_END records
         emit_call_metadata(cs, call_info);
