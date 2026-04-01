@@ -287,7 +287,8 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
         cs.tmp_path = tmp_dir_ + "/call_" + std::to_string(cs.call_id) + ".dvcf.tmp";
         cs.file.open(cs.tmp_path, std::ios::binary | std::ios::trunc);
         if (!cs.file.is_open()) {
-            BOOST_LOG_TRIVIAL(error) << TAG << "Cannot open " << cs.tmp_path;
+            BOOST_LOG_TRIVIAL(error) << TAG << "Cannot open " << cs.tmp_path
+                << ": " << strerror(errno);
             return false;
         }
         return true;
@@ -476,11 +477,14 @@ public:
         // First frame: open file and write CALL_START header
         if (cs->frame_count == 0) {
             if (!ensure_file_open(*cs)) {
-                calls_.erase(reinterpret_cast<uintptr_t>(call));
+                BOOST_LOG_TRIVIAL(error) << TAG << "Dropping call_id=" << cs->call_id
+                    << " TG=" << cs->talkgroup << ": file open failed";
+                cs->frame_count = UINT32_MAX;  // poison — suppress per-frame retries
                 return 0;
             }
             emit_call_start(*cs);
         }
+        if (cs->frame_count == UINT32_MAX) return 0;  // poisoned
 
         emit(*cs, &hdr, sizeof(hdr));
         emit(*cs, &chdr, sizeof(chdr));
@@ -507,8 +511,11 @@ public:
         if (!key) return 0;
         CallState &cs = calls_[key];
 
-        // No codec frames received — nothing was written (e.g. analog calls).
-        if (cs.frame_count == 0) { calls_.erase(key); return 0; }
+        // No usable codec frames — analog calls, poisoned calls, or empty streams.
+        if (cs.frame_count == 0 || cs.frame_count == UINT32_MAX) {
+            calls_.erase(key);
+            return 0;
+        }
 
         // Write CALL_METADATA + CALL_END records
         emit_call_metadata(cs, call_info);
