@@ -17,7 +17,8 @@
  *     "clientid": "dvcf-handler",
  *     "username": "",
  *     "password": "",
- *     "qos": 0
+ *     "qos": 0,
+ *     "stale_call_timeout_sec": 300
  *   }
  */
 
@@ -138,10 +139,11 @@ static std::string bytes_to_base64(const std::vector<uint8_t> &buf) {
 /* ── Per-call state ──────────────────────────────────────────────────── */
 
 struct CallState {
-    long        talkgroup   = 0;
-    uint32_t    call_id     = 0;
-    uint64_t    freq_hz     = 0;
-    uint64_t    start_us    = 0;
+    long        talkgroup      = 0;
+    uint32_t    call_id        = 0;
+    uint64_t    freq_hz        = 0;
+    uint64_t    start_us       = 0;
+    uint64_t    last_active_us = 0;
     std::string short_name;
     bool        started     = false;
     uint32_t    frame_count = 0;
@@ -186,6 +188,9 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
 
     // Disk temp dir
     std::string tmp_dir_;
+
+    // Stale-call reaper
+    uint64_t stale_timeout_us_ = 300'000'000;  // default 5 minutes
 
     /* ── Output helpers (write to file or memory) ────────────────────── */
 
@@ -274,11 +279,12 @@ class Dvcf_Handler : public Plugin_Api, public virtual mqtt::callback {
         if (it != calls_.end()) return &it->second;
 
         CallState &cs = calls_[key];
-        cs.talkgroup  = call->get_talkgroup();
-        cs.call_id    = next_id_++;
-        cs.freq_hz    = static_cast<uint64_t>(call->get_freq());
-        cs.start_us   = now_us();
-        cs.short_name = call->get_short_name();
+        cs.talkgroup      = call->get_talkgroup();
+        cs.call_id        = next_id_++;
+        cs.freq_hz        = static_cast<uint64_t>(call->get_freq());
+        cs.start_us       = now_us();
+        cs.last_active_us = cs.start_us;
+        cs.short_name     = call->get_short_name();
         return &cs;
     }
 
@@ -407,6 +413,8 @@ public:
         username_  = config_data.value("username", "");
         password_  = config_data.value("password", "");
         qos_       = config_data.value("qos", 0);
+        stale_timeout_us_ = static_cast<uint64_t>(
+            config_data.value("stale_call_timeout_sec", 300)) * 1'000'000ULL;
         if (!topic_.empty() && topic_.back() == '/') topic_.pop_back();
 
         BOOST_LOG_TRIVIAL(info) << TAG << "write_enabled=" << write_enabled_
@@ -441,6 +449,26 @@ public:
             mqtt_connected_ = false;
         }
         mqtt_client_.reset();
+        return 0;
+    }
+
+    /* ── poll_one — reap stale calls that never received call_end ───── */
+
+    int poll_one() override {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (calls_.empty()) return 0;
+
+        uint64_t cutoff = now_us() - stale_timeout_us_;
+        for (auto it = calls_.begin(); it != calls_.end(); ) {
+            if (it->second.last_active_us < cutoff) {
+                BOOST_LOG_TRIVIAL(warning) << TAG << "Reaping stale call_id="
+                    << it->second.call_id << " TG=" << it->second.talkgroup
+                    << " (" << it->second.frame_count << " frames, no call_end)";
+                it = calls_.erase(it);  // ~CallState cleans up file + tmp
+            } else {
+                ++it;
+            }
+        }
         return 0;
     }
 
@@ -489,6 +517,7 @@ public:
         emit(*cs, &hdr, sizeof(hdr));
         emit(*cs, &chdr, sizeof(chdr));
         if (param_count > 0) emit(*cs, params, psz);
+        cs->last_active_us = chdr.timestamp_us;
         ++cs->frame_count;
         return 0;
     }
