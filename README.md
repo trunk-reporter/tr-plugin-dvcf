@@ -19,7 +19,9 @@ This plugin taps trunk-recorder's `voice_codec_data()` callback to capture the r
 ## Features
 
 - **File writing** — saves `.dvcf` sidecar files alongside audio recordings (same base name, `.dvcf` extension)
-- **MQTT publishing** — publishes codec frames as `audio_tap_base64` in the MQTT call-end message, compatible with [tr-engine](https://github.com/trunk-reporter/tr-engine)
+- **MQTT publishing** — publishes codec frames as `audio_dvcf_base64` in the MQTT call-end message, compatible with [tr-engine](https://github.com/trunk-reporter/tr-engine)
+- **Analog-safe** — only digital calls (P25, DMR, D-STAR, YSF) produce `.dvcf` files; analog calls are ignored automatically
+- **Stale-call reaper** — detects calls that never receive a `call_end` (a known trunk-recorder bug) and salvages their data instead of leaking resources
 - Both features independently toggleable via config
 
 ## File Format
@@ -88,7 +90,8 @@ Add to your trunk-recorder `config.json`:
       "clientid": "dvcf-plugin",
       "username": "",
       "password": "",
-      "qos": 0
+      "qos": 0,
+      "stale_call_timeout_sec": 300
     }
   ]
 }
@@ -104,6 +107,7 @@ Add to your trunk-recorder `config.json`:
 | `username` | `""` | MQTT username (optional) |
 | `password` | `""` | MQTT password (optional) |
 | `qos` | `0` | MQTT QoS level |
+| `stale_call_timeout_sec` | `300` | Seconds of inactivity before a call without `call_end` is reaped. Data is salvaged to `.stale` files when possible. |
 
 ## MQTT Message Format
 
