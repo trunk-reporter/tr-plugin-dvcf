@@ -515,7 +515,11 @@ public:
     int call_start(Call *call) override {
         if (!write_enabled_ && !mqtt_enabled_) return 0;
         std::lock_guard<std::mutex> lk(mu_);
-        get_or_create(call);
+        CallState *cs = get_or_create(call);
+        BOOST_LOG_TRIVIAL(debug) << TAG << "call_start call_id=" << cs->call_id
+            << " TG=" << cs->talkgroup
+            << " short_name=" << cs->short_name
+            << " freq=" << cs->freq_hz;
         return 0;
     }
 
@@ -542,6 +546,11 @@ public:
 
         // First frame: open file and write CALL_START header
         if (cs->frame_count == 0) {
+            BOOST_LOG_TRIVIAL(debug) << TAG << "first voice_codec_data call_id="
+                << cs->call_id << " TG=" << cs->talkgroup
+                << " codec_type=" << codec_type
+                << " param_count=" << param_count
+                << " src_id=" << src_id;
             if (!ensure_file_open(*cs)) {
                 BOOST_LOG_TRIVIAL(error) << TAG << "Dropping call_id=" << cs->call_id
                     << " TG=" << cs->talkgroup << ": file open failed";
@@ -561,6 +570,11 @@ public:
 
     /* ── call_end ────────────────────────────────────────────────────── */
 
+    // TODO: Instrument skipped calls here by audio_type, codec_type, and
+    // talkgroup to investigate low DVCF production ratio. Add counters for
+    // each skip reason: no matching stream, frame_count==0, poisoned, empty
+    // filename, and correlate with trunk-recorder's audio_type/codec_type.
+
     int call_end(Call_Data_t call_info) override {
         if (!write_enabled_ && !mqtt_enabled_) return 0;
         std::lock_guard<std::mutex> lk(mu_);
@@ -574,11 +588,22 @@ public:
             if (kv.second.talkgroup == call_info.talkgroup &&
                 kv.second.short_name == call_info.short_name) { key = kv.first; break; }
         }
-        if (!key) return 0;
+        if (!key) {
+            BOOST_LOG_TRIVIAL(debug) << TAG << "call_end without active stream TG="
+                << call_info.talkgroup
+                << " short_name=" << call_info.short_name
+                << " audio_type=" << call_info.audio_type;
+            return 0;
+        }
         CallState &cs = calls_[key];
 
         // No usable codec frames — analog calls, poisoned calls, or empty streams.
         if (cs.frame_count == 0 || cs.poisoned) {
+            BOOST_LOG_TRIVIAL(debug) << TAG << "call_end skipped call_id="
+                << cs.call_id << " TG=" << cs.talkgroup
+                << " frames=" << cs.frame_count
+                << " poisoned=" << cs.poisoned
+                << " audio_type=" << call_info.audio_type;
             calls_.erase(key);
             return 0;
         }
