@@ -1,4 +1,6 @@
-# SymbolStream Protocol v2
+# SymbolStream Protocol v2 (document revision 2.1)
+
+Revision 2.1 changes the document only: the wire `version` byte stays 2.
 
 Framing specification for streaming raw voice codec parameters (IMBE, AMBE+2, AMBE, etc.)
 from trunk-recorder to external consumers via TCP or UDP.
@@ -182,6 +184,15 @@ must ignore unknown keys.
 | `signal_system`  | string | Signal system identifier          |
 | `tag`            | string | Unit/radio tag (e.g., "Engine 5") |
 
+**Keys written by Trunk Recorder Pro's `dvcf` plugin:**
+
+| Key                   | Type   | Description                                                   |
+|-----------------------|--------|---------------------------------------------------------------|
+| `trunk_recorder_call` | object | The recorder's complete call record, exactly as its `.json` file holds it (see Trunk Recorder Pro's call JSON documentation) |
+| `trunk_recorder_pro`  | object | Writer details: `version` (the recorder's version string), `plugin` (e.g., `dvcf 0.1.0`), `frames_file` (`sdr` or `frames.jsonl`: which capture file the frames came from) |
+
+Both keys are optional. Receivers that do not use them ignore them, as for any unknown key.
+
 **Example:**
 
 ```json
@@ -340,6 +351,8 @@ each codec's standard; symbolstream does not transform them.
 | 129   | MELPe    | —            | variable    | Future                           |
 | 130+  | —        | —            | —           | Reserved                         |
 
+Trunk Recorder Pro produces types 0, 1, 2 and 6 only.
+
 When receiving a codec type not in this table, use `param_count` to consume the correct
 number of uint32 params and continue. Do not abort.
 
@@ -418,50 +431,28 @@ layout in `codec_params[]`.
 
 **Frame layout:**
 
-| Index | Bits used | Content |
-|-------|-----------|---------|
-| params[0] | 24 | AMBE+2 channel data bytes 0–2 |
-| params[1] | 24 | AMBE+2 channel data bytes 3–5 |
-| params[2] | 24 | AMBE+2 channel data bytes 6–8 |
-| params[3] | 8 | AMBE+2 channel data byte 9 (last); upper 24 bits zero |
+| Index | Bits | Content |
+|-------|------|---------|
+| params[0] | 12 | Information word u0 |
+| params[1] | 12 | Information word u1 |
+| params[2] | 11 | Information word u2 |
+| params[3] | 14 | Information word u3 |
 
-The AMBE+2 full-rate vocoder produces **72 bits** (9 bytes) of channel data per 20 ms frame.
-Trunk-recorder distributes these 9 bytes across 4 × uint32_t words, 3 bytes per word
-(lower 24 bits), with the last word carrying the remaining byte in the lowest 8 bits.
+**Totals:** 49 information bits per frame = 2 × 12 + 11 + 14.
 
-**Reconstructing the 9-byte AMBE+2 channel frame:**
+The four params are the AMBE+2 information words after FEC decoding, as trunk-recorder's
+`voice_codec_data()` callback hands them and as both the C++ plugin and Trunk Recorder Pro's
+`dvcf` plugin have always written them. Each word is right-aligned in its `uint32_t`: only
+the lower N bits are significant, upper bits are zero, and the word's bits are in order,
+MSB first.
 
-```python
-def ambe2_params_to_bytes(params: list[int]) -> bytes:
-    """Reconstruct 9-byte AMBE+2 channel frame from 4 codec params."""
-    out = bytearray(9)
-    for i in range(3):
-        out[i*3 + 0] =  params[i]        & 0xFF
-        out[i*3 + 1] = (params[i] >>  8) & 0xFF
-        out[i*3 + 2] = (params[i] >> 16) & 0xFF
-    out[8] = params[3] & 0xFF
-    return bytes(out)
-```
-
-**Forwarding to a DVSI hardware vocoder (DV3000 / DVstick30):**
-
-```python
-import struct
-
-def build_ambeserver_packet(params: list[int]) -> bytes:
-    """Wrap AMBE+2 channel frame in AMBEserver CH_RX packet format."""
-    channel_bytes = ambe2_params_to_bytes(params)
-    # AMBEserver packet: start_byte(1) + type(1) + length(2) + data
-    START = 0x61
-    TYPE_CH_RX = 0x01
-    pkt_len = len(channel_bytes) + 4
-    return struct.pack('>BBH', START, TYPE_CH_RX, pkt_len) + channel_bytes
-```
+Files written before this revision also hold these words: the earlier text described the
+72-bit channel frame, which no writer produced.
 
 **Note on codec_type 1 vs 2:** P25 Phase 2 (type 1) and DMR (type 2) both use AMBE+2 with
 the same bit rate and frame structure. The codec type field distinguishes the **system
 origin** so consumers can apply system-appropriate FEC threshold policies or routing rules.
-The channel bytes themselves are processed identically.
+The codec words themselves are processed identically.
 
 **FEC error guidance for AMBE+2:**
 
@@ -682,6 +673,9 @@ A `.dvcf` file is a concatenation of SymbolStream v2 binary messages (§3) repre
 
 Receivers must dispatch on `msg_type`, not on message position within the file.
 `CALL_METADATA` may appear at any point between `CALL_START` and `CALL_END`.
+
+`flags` bit 0 of a CODEC_FRAME marks a frame the recorder's vocoder did not play as received
+(lost, repeated or muted); its codec words are a reconstruction.
 
 ### 9.2 MIME Type
 
